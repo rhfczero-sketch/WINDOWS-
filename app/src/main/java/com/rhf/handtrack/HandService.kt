@@ -64,27 +64,18 @@ class OneEuro(
 class HandService : LifecycleService() {
     companion object {
         private const val USE_GPU = true
-        private const val POINTER = 5          // 5 = buku jari telunjuk (stabil), 8 = ujung telunjuk
-        private const val PINCH_ON = 0.28
-        private const val PINCH_OFF = 0.42
-        private const val PINCH_OPEN = 0.55
-        private const val TAP_STILL = 0.30
-        private const val TAP_COOLDOWN = 350L
-        private const val SWIPE_PALMS = 1.0
-        private const val SWIPE_SPEED = 3.0
-        private const val SWIPE_WINDOW = 0.35
-        private const val SWIPE_COOLDOWN = 450L
-        private const val OPPOSITE_LOCK = 800L
+        private const val MARGIN = 0.15          // area aktif kamera (makin besar = makin sensitif)
+        private const val DEAD_PX = 2.5          // getaran di bawah ini diabaikan
+        private const val STABLE_FRAMES = 4      // pose harus stabil N frame sebelum dieksekusi
+        private const val TAP_COOLDOWN = 400L
+        private const val REPEAT_DELAY = 700L    // tahan jari = geser berulang
+        private const val REPEAT_EVERY = 450L
+        private const val BACK_HOLD = 1000L      // telapak terbuka ditahan = Kembali
     }
 
-    private class Sample(
-        val t: Double,
-        val sx: Double,
-        val sy: Double,
-        val px: Double,
-        val py: Double,
-        val pose: Boolean
-    )
+    private enum class Pose { NONE, FIST, THUMB, INDEX, MIDDLE, RING, PINKY, OPEN }
+
+    private class Pos(val t: Double, val x: Float, val y: Float)
 
     private lateinit var executor: ExecutorService
     private lateinit var nm: NotificationManager
@@ -94,18 +85,21 @@ class HandService : LifecycleService() {
     private val fx = Array(21) { OneEuro() }
     private val fy = Array(21) { OneEuro() }
     private val fz = Array(21) { OneEuro() }
-    private val hist = ArrayDeque<Sample>()
+    private val sxF = OneEuro(0.9, 0.015, 1.0)
+    private val syF = OneEuro(0.9, 0.015, 1.0)
+    private val posHist = ArrayDeque<Pos>()
 
-    private var visibleSince = 0L
-    private var pinching = false
-    private var pinchFrames = 0
-    private var openFrames = 0
-    private var tapReady = false
+    private var curX = -1f
+    private var curY = -1f
+    private var lastFistT = 0.0
+    private var candidate = Pose.NONE
+    private var candFrames = 0
+    private var active = Pose.NONE
+    private var poseStartAt = 0L
+    private var lastFireAt = 0L
     private var lastTapAt = 0L
-    private var lastSwipeAt = 0L
-    private var lastDir = 0
-    private var fistSince = 0L
-    private var fistDone = false
+    private var repeatCount = 0
+    private var backDone = false
     private var lastStatus = ""
 
     override fun onCreate() {
@@ -169,7 +163,7 @@ class HandService : LifecycleService() {
             .setBaseOptions(base)
             .setRunningMode(RunningMode.LIVE_STREAM)
             .setNumHands(1)
-            .setMinHandDetectionConfidence(0.6f)
+            .setMinHandDetectionConfidence(0.5f)
             .setMinHandPresenceConfidence(0.5f)
             .setMinTrackingConfidence(0.5f)
             .setResultListener { r, img -> onResult(r, img) }
@@ -209,47 +203,42 @@ class HandService : LifecycleService() {
         for (f in fx) f.reset()
         for (f in fy) f.reset()
         for (f in fz) f.reset()
-        hist.clear()
-        pinching = false
-        pinchFrames = 0
-        openFrames = 0
-        tapReady = false
-        fistSince = 0L
-        fistDone = false
-        visibleSince = 0L
+        sxF.reset()
+        syF.reset()
+        posHist.clear()
+        candidate = Pose.NONE
+        candFrames = 0
+        active = Pose.NONE
+        backDone = false
         ControlService.instance?.hideCursor()
         status("Tangan tidak terlihat")
     }
 
-    // seberapa jauh telapak bergerak dalam 0,2 detik terakhir (satuan: panjang telapak)
-    private fun moved(palm: Double): Double {
-        val last = hist.last()
-        for (s in hist) {
-            if (last.t - s.t <= 0.2) return hypot(last.px - s.px, last.py - s.py) / palm
+    // posisi kursor sedikit sebelum jari mulai terbuka (supaya tap tepat di titik yang dibidik)
+    private fun anchorPos(): Pos? {
+        if (posHist.isEmpty()) return null
+        val target = lastFistT - 0.12
+        var best = posHist.first()
+        for (p in posHist) {
+            if (p.t <= target) best = p else break
         }
-        return 0.0
+        return best
     }
 
-    // 1 = kanan, 2 = kiri, 3 = atas, 4 = bawah, 0 = tidak ada
-    private fun detectSwipe(palm: Double): Int {
-        val last = hist.last()
-        var i = hist.size - 2
-        while (i >= 0) {
-            val s = hist[i]
-            val dt = last.t - s.t
-            if (dt > SWIPE_WINDOW || !s.pose) break
-            if (dt >= 0.06) {
-                val dx = (last.sx - s.sx) / palm
-                val dy = (last.sy - s.sy) / palm
-                val dist = hypot(dx, dy)
-                if (dist >= SWIPE_PALMS && dist / dt >= SWIPE_SPEED) {
-                    if (abs(dx) > abs(dy) * 2.0) return if (dx > 0) 1 else 2
-                    if (abs(dy) > abs(dx) * 2.0) return if (dy < 0) 3 else 4
-                }
+    private fun fire(p: Pose, svc: ControlService, now: Long, sw: Float, sh: Float) {
+        when (p) {
+            Pose.THUMB -> if (now - lastTapAt > TAP_COOLDOWN) {
+                lastTapAt = now
+                svc.tap(curX, curY)
+                status("Tap")
             }
-            i--
+            Pose.INDEX -> { svc.swipe(sw * 0.5f, sh * 0.7f, sw * 0.5f, sh * 0.3f); status("Geser atas") }
+            Pose.MIDDLE -> { svc.swipe(sw * 0.5f, sh * 0.3f, sw * 0.5f, sh * 0.7f); status("Geser bawah") }
+            Pose.RING -> { svc.swipe(sw * 0.2f, sh * 0.5f, sw * 0.8f, sh * 0.5f); status("Geser kanan") }
+            Pose.PINKY -> { svc.swipe(sw * 0.8f, sh * 0.5f, sw * 0.2f, sh * 0.5f); status("Geser kiri") }
+            else -> {}
         }
-        return 0
+        lastFireAt = now
     }
 
     private fun onResult(r: HandLandmarkerResult, img: MPImage) {
@@ -260,7 +249,6 @@ class HandService : LifecycleService() {
         val w = img.width.toDouble()
         val h = img.height.toDouble()
         val lm = hands[0]
-        if (visibleSince == 0L) visibleSince = now
 
         val px = DoubleArray(21)
         val py = DoubleArray(21)
@@ -294,90 +282,87 @@ class HandService : LifecycleService() {
         val palm = d3(0, 9)
         if (palm < 20.0) return
 
-        // 0 = telunjuk, 1 = tengah, 2 = manis, 3 = kelingking
+        // ext[0..3] = telunjuk, tengah, manis, kelingking; thumb = jempol
         val ext = BooleanArray(4)
-        val curl = BooleanArray(4)
         for (f in 0 until 4) {
             val m = 5 + f * 4
             val a1 = ang(m, m + 1, m + 2)
             val a2 = ang(m + 1, m + 2, m + 3)
             ext[f] = a1 > 150.0 && a2 > 145.0 && d3(m + 3, 0) > d3(m + 1, 0)
-            curl[f] = a1 < 130.0
         }
-        val swipePose = ext[0] && ext[1] && !ext[2] && !ext[3]
-        val fist = curl[0] && curl[1] && curl[2] && curl[3]
-        val canPinch = !swipePose && !fist
-
-        val ratio = d3(4, 8) / palm
-        val was = pinching
-        pinching = if (!canPinch) false else if (pinching) ratio < PINCH_OFF else ratio < PINCH_ON
-        if (pinching && !was) {
-            tapReady = openFrames >= 2
-            openFrames = 0
-            pinchFrames = 1
-        } else if (pinching) {
-            pinchFrames++
-        } else {
-            pinchFrames = 0
-            if (ratio > PINCH_OPEN) openFrames++
+        val thumb = ang(2, 3, 4) > 145.0 && d3(4, 5) / palm > 0.8
+        val count = ext.count { it } + (if (thumb) 1 else 0)
+        val pose = when {
+            count == 0 -> Pose.FIST
+            count == 5 -> Pose.OPEN
+            count == 1 -> when {
+                thumb -> Pose.THUMB
+                ext[0] -> Pose.INDEX
+                ext[1] -> Pose.MIDDLE
+                ext[2] -> Pose.RING
+                else -> Pose.PINKY
+            }
+            else -> Pose.NONE
         }
-
-        val pcx = (px[0] + px[5] + px[9] + px[13] + px[17]) / 5.0
-        val pcy = (py[0] + py[5] + py[9] + py[13] + py[17]) / 5.0
-        hist.addLast(Sample(t, (px[8] + px[12]) / 2.0, (py[8] + py[12]) / 2.0, pcx, pcy, swipePose))
-        while (hist.size > 1 && t - hist.first().t > 0.6) hist.removeFirst()
 
         val svc = ControlService.instance
         if (svc == null) { status("Aksesibilitas belum aktif"); return }
         val dm = resources.displayMetrics
         val sw = dm.widthPixels.toFloat()
         val sh = dm.heightPixels.toFloat()
-        val cxs = (((px[POINTER] / w) - 0.12) / 0.76).coerceIn(0.0, 1.0).toFloat() * sw
-        val cys = (((py[POINTER] / h) - 0.12) / 0.76).coerceIn(0.0, 1.0).toFloat() * sh
-        svc.showCursor(cxs, cys, pinching)
+        if (curX < 0f) { curX = sw / 2f; curY = sh / 2f }
 
-        // Kepalan ditahan = Kembali
-        if (fist) {
-            if (fistSince == 0L) fistSince = now
-            if (!fistDone && now - fistSince > 900) {
-                fistDone = true
+        // Kepalan = gerakkan kursor (titik acuan: rata-rata 4 buku jari, paling stabil)
+        if (pose == Pose.FIST) {
+            val ax = (px[5] + px[9] + px[13] + px[17]) / 4.0
+            val ay = (py[5] + py[9] + py[13] + py[17]) / 4.0
+            val span = 1.0 - 2.0 * MARGIN
+            val rx = (((ax / w) - MARGIN) / span).coerceIn(0.0, 1.0) * sw
+            val ry = (((ay / h) - MARGIN) / span).coerceIn(0.0, 1.0) * sh
+            val nx = sxF.filter(rx, t)
+            val ny = syF.filter(ry, t)
+            if (hypot(nx - curX, ny - curY) >= DEAD_PX) {
+                curX = nx.toFloat()
+                curY = ny.toFloat()
+            }
+            lastFistT = t
+            posHist.addLast(Pos(t, curX, curY))
+            while (posHist.size > 1 && t - posHist.first().t > 0.6) posHist.removeFirst()
+        }
+
+        // pose harus stabil beberapa frame sebelum dianggap perintah
+        if (pose == candidate) candFrames++ else { candidate = pose; candFrames = 1 }
+        if (candFrames >= STABLE_FRAMES && candidate != active) {
+            active = candidate
+            poseStartAt = now
+            repeatCount = 0
+            backDone = false
+            if (active == Pose.THUMB || active == Pose.INDEX || active == Pose.MIDDLE ||
+                active == Pose.RING || active == Pose.PINKY) {
+                anchorPos()?.let { curX = it.x; curY = it.y }
+                fire(active, svc, now, sw, sh)
+            }
+        } else if (candidate == active) {
+            // tahan jari geser = geser berulang
+            if (active == Pose.INDEX || active == Pose.MIDDLE || active == Pose.RING || active == Pose.PINKY) {
+                val gap = if (repeatCount == 0) REPEAT_DELAY else REPEAT_EVERY
+                if (now - lastFireAt >= gap) {
+                    repeatCount++
+                    fire(active, svc, now, sw, sh)
+                }
+            }
+            // telapak terbuka ditahan = Kembali
+            if (active == Pose.OPEN && !backDone && now - poseStartAt >= BACK_HOLD) {
+                backDone = true
                 svc.back()
                 status("Kembali")
             }
-        } else {
-            fistSince = 0L
-            fistDone = false
         }
 
-        // Ketukan jempol + telunjuk = Tap
-        if (pinchFrames == 2 && tapReady && now - lastTapAt > TAP_COOLDOWN && moved(palm) < TAP_STILL) {
-            lastTapAt = now
-            svc.tap(cxs, cys)
-            status("Tap")
-            return
-        }
+        svc.showCursor(curX, curY, pose != Pose.FIST)
 
-        // 2 jari (telunjuk + tengah) digeser cepat = Swipe
-        if (swipePose && now - visibleSince > 400 && now - lastSwipeAt > SWIPE_COOLDOWN) {
-            val dir = detectSwipe(palm)
-            if (dir != 0) {
-                val opp = (dir == 1 && lastDir == 2) || (dir == 2 && lastDir == 1) ||
-                    (dir == 3 && lastDir == 4) || (dir == 4 && lastDir == 3)
-                if (!(opp && now - lastSwipeAt < OPPOSITE_LOCK)) {
-                    when (dir) {
-                        1 -> { svc.swipe(sw * 0.2f, sh * 0.5f, sw * 0.8f, sh * 0.5f); status("Geser kanan") }
-                        2 -> { svc.swipe(sw * 0.8f, sh * 0.5f, sw * 0.2f, sh * 0.5f); status("Geser kiri") }
-                        3 -> { svc.swipe(sw * 0.5f, sh * 0.7f, sw * 0.5f, sh * 0.3f); status("Geser atas") }
-                        else -> { svc.swipe(sw * 0.5f, sh * 0.3f, sw * 0.5f, sh * 0.7f); status("Geser bawah") }
-                    }
-                    lastSwipeAt = now
-                    lastDir = dir
-                    hist.clear()
-                    return
-                }
-            }
+        if (now - lastFireAt > 1200 && now - lastTapAt > 1200 && !backDone) {
+            status(if (pose == Pose.FIST) "Kursor" else "Tangan terdeteksi")
         }
-
-        if (now - lastSwipeAt > 1200 && now - lastTapAt > 1200) status("Tangan terdeteksi")
     }
 }
