@@ -46,10 +46,10 @@ class MainActivity : ComponentActivity() {
         }
         box.addView(TextView(this).apply {
             text = "HandTrack Kontrol\n\n" +
-                "Telapak terbuka digeser cepat = swipe\n" +
-                "Pinch jempol + telunjuk = tap\n" +
+                "Angkat 2 jari (telunjuk + tengah) lalu geser cepat = swipe\n" +
+                "Ketuk jempol + telunjuk = tap (titik merah = posisi tap)\n" +
                 "Kepalan ditahan 1 detik = kembali\n\n" +
-                "Diam sebentar sebelum tiap swipe."
+                "Tahan pose 2 jari sebentar sebelum swipe."
             textSize = 16f
         })
         box.addView(Button(this).apply {
